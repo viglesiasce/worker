@@ -35,6 +35,7 @@ import (
 	"golang.org/x/oauth2/jwt"
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
+	"os"
 )
 
 const (
@@ -471,6 +472,8 @@ func (p *gceProvider) apiRateLimit(ctx gocontext.Context) error {
 	for {
 		ok, err := p.rateLimiter.RateLimit("gce-api", p.rateLimitMaxCalls, p.rateLimitDuration)
 		if err != nil {
+			context.CaptureError(ctx, err)
+			context.LoggerFromContext(ctx).WithField("err", err).Info("Received an error when trying to get rate limiter")
 			errCount++
 			if errCount >= 5 {
 				context.CaptureError(ctx, err)
@@ -485,7 +488,9 @@ func (p *gceProvider) apiRateLimit(ctx gocontext.Context) error {
 		}
 
 		// Sleep for up to 1 second
-		time.Sleep(time.Millisecond * time.Duration(mathrand.Intn(1000)))
+		delay := time.Millisecond * time.Duration(mathrand.Intn(1000))
+		context.LoggerFromContext(ctx).WithField("sleep", delay).Info("Sleeping before trying to get rate limiter again")
+		time.Sleep(delay)
 	}
 }
 
@@ -520,6 +525,55 @@ func (p *gceProvider) Setup(ctx gocontext.Context) error {
 
 	return nil
 }
+
+type logTransport struct {
+        rt http.RoundTripper
+}
+
+
+func (t *logTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+        var buf bytes.Buffer
+
+        if req.Body != nil {
+                req.Body = ioutil.NopCloser(&readButCopy{req.Body, &buf})
+        }
+        req.Write(os.Stdout)
+        if req.Body != nil {
+                req.Body = ioutil.NopCloser(&buf)
+        }
+
+        res, err := t.rt.RoundTrip(req)
+        return res, err
+}
+
+type echoAsRead struct {
+        src io.Reader
+}
+
+func (r *echoAsRead) Read(p []byte) (int, error) {
+        n, err := r.src.Read(p)
+        if n > 0 {
+						os.Stdout.Write(p[:n])
+        }
+        if err == io.EOF {
+                fmt.Printf("\n[/response]\n")
+        }
+        return n, err
+}
+
+type readButCopy struct {
+        src io.Reader
+        dst io.Writer
+}
+
+func (r *readButCopy) Read(p []byte) (int, error) {
+        n, err := r.src.Read(p)
+        if n > 0 {
+                r.dst.Write(p[:n])
+        }
+        return n, err
+}
+
 
 func buildGoogleComputeService(cfg *config.ProviderConfig) (*compute.Service, error) {
 	if !cfg.IsSet("ACCOUNT_JSON") {
@@ -686,6 +740,10 @@ func (p *gceProvider) stepWaitForInstanceIP(c *gceStartContext) multistep.StepAc
 
 		if newOp.Status == "RUNNING" || newOp.Status == "DONE" {
 			if newOp.Error != nil {
+				logger.WithFields(logrus.Fields{
+					"error": newOp.Error,
+				}).Debug("Error with instance state")
+
 				c.errChan <- &gceOpError{Err: newOp.Error}
 				return multistep.ActionHalt
 			}
